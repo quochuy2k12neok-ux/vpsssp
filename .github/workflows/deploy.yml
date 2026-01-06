@@ -1,0 +1,171 @@
+name: Pterodactyl Panel + Wings 24/7 Self-Restart
+
+on:
+  repository_dispatch:
+    types: [start-ptero]
+  workflow_dispatch:  # Quan trọng: phải có dòng này để hiện nút Run workflow
+
+jobs:
+  run-ptero:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Chạy tối đa ~5h50p rồi tự restart
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install necessary tools
+        run: |
+          sudo apt update && sudo apt install -y docker.io docker-compose curl jq
+          curl https://rclone.org/install.sh | sudo bash
+          curl -sL https://ngrok.com/download > ngrok.tgz && tar xzf ngrok.tgz
+
+      - name: Setup Rclone configuration
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF_BASE64 }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" | base64 -d > ~/.config/rclone/rclone.conf
+
+      - name: Restore latest backup from gdrive1
+        run: |
+          mkdir -p backups
+          rclone sync gdrive1:/pterobackups/ ./backups/ --progress || echo "No backup folder yet"
+          latest=$(ls -t backups/latest-full-*.tar.gz 2>/dev/null | head -1)
+          if [ -n "$latest" ]; then
+            echo "Đang restore backup mới nhất: $latest"
+            tar -xzvf "$latest" -C /
+            echo "Restore hoàn tất"
+          else
+            echo "Không có backup cũ – khởi động mới hoàn toàn"
+          fi
+
+      - name: Create docker-compose files
+        run: |
+          mkdir -p pterodactyl/panel pterodactyl/wings
+
+          cat > pterodactyl/panel/docker-compose.yml << 'EOF'
+version: '3.8'
+x-common:
+  database: &db-environment
+    MYSQL_PASSWORD: &db-password "${{ secrets.DB_PASS }}"
+    MYSQL_ROOT_PASSWORD: "${{ secrets.DB_ROOT_PASS }}"
+  panel: &panel-environment
+    APP_URL: "https://${{ secrets.NGROK_DOMAIN }}"
+    APP_TIMEZONE: "Asia/Ho_Chi_Minh"
+    APP_SERVICE_AUTHOR: "noreply@example.com"
+    TRUSTED_PROXIES: "*"
+services:
+  database:
+    image: mariadb:10.11
+    restart: always
+    volumes:
+      - database:/var/lib/mysql
+    environment:
+      <<: *db-environment
+      MYSQL_DATABASE: "panel"
+      MYSQL_USER: "pterodactyl"
+  cache:
+    image: redis:alpine
+    restart: always
+  panel:
+    image: ghcr.io/pterodactyl/panel:latest
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - database
+      - cache
+    volumes:
+      - panel_var:/app/var/
+      - panel_logs:/app/storage/logs
+    environment:
+      <<: [*panel-environment]
+      DB_PASSWORD: *db-password
+      APP_ENV: "production"
+      CACHE_DRIVER: "redis"
+      SESSION_DRIVER: "redis"
+      QUEUE_DRIVER: "redis"
+      REDIS_HOST: "cache"
+      DB_HOST: "database"
+volumes:
+  database:
+  panel_var:
+  panel_logs:
+EOF
+
+          cat > pterodactyl/wings/docker-compose.yml << 'EOF'
+version: '3.8'
+services:
+  wings:
+    image: ghcr.io/pterodactyl/wings:latest
+    restart: always
+    ports:
+      - "8080:8080"
+      - "2022:2022"
+    tty: true
+    stdin_open: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - wings_config:/etc/pterodactyl/
+      - wings_data:/var/lib/pterodactyl/
+      - wings_logs:/var/log/pterodactyl/
+      - /tmp/pterodactyl/:/tmp/pterodactyl/
+volumes:
+  wings_config:
+  wings_data:
+  wings_logs:
+EOF
+
+      - name: Start Panel and Wings
+        run: |
+          cd pterodactyl/panel && docker-compose up -d
+          cd ../wings && docker-compose up -d
+
+      - name: Initial Panel setup (nếu cần)
+        run: |
+          cd pterodactyl/panel
+          docker-compose exec panel php artisan key:generate --force || true
+          docker-compose exec panel php artisan migrate --seed --force || true
+
+      - name: Start Ngrok with static domain
+        run: |
+          ./ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+          ./ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > ngrok.log 2>&1 &
+          echo "Pterodactyl Panel đang chạy tại: https://${{ secrets.NGROK_DOMAIN }}"
+          sleep 15
+
+      - name: Final full backup & Self-restart
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          START=$(date +%s)
+          while true; do
+            ELAPSED=$((($(date +%s) - START)/60))
+            if [ $ELAPSED -ge 330 ]; then
+              echo "=== BẮT ĐẦU FINAL FULL BACKUP TRƯỚC KHI RESTART ==="
+              BACKUP_FILE="/tmp/ptero-full-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+              tar -czvf "$BACKUP_FILE" \
+                /pterodactyl/ \
+                /var/lib/docker/volumes/ || true
+
+              rclone copy "$BACKUP_FILE" gdrive1:/pterobackups/ --progress
+              cp "$BACKUP_FILE" backups/latest-full-$(date +%Y%m%d-%H%M%S).tar.gz
+              rclone copy backups/latest-full-*.tar.gz gdrive1:/pterobackups/ --progress
+
+              echo "Final backup hoàn tất và đã đồng bộ lên gdrive1"
+
+              curl -X POST \
+                -H "Authorization: token $PAT" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/repos/${{ github.repository }}/dispatches \
+                -d '{"event_type":"start-ptero"}'
+
+              echo "Đã trigger workflow mới thành công."
+              exit 0
+            fi
+            echo "Đã chạy $ELAPSED phút – tiếp tục giữ alive..."
+            sleep 300
+          done
+
+      - name: Keep workflow alive
+        run: tail -f /dev/null
