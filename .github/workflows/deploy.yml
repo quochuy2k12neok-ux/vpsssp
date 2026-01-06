@@ -3,12 +3,12 @@ name: Pterodactyl Panel + Wings 24/7 Self-Restart
 on:
   repository_dispatch:
     types: [start-ptero]
-  workflow_dispatch:  # Quan trọng: phải có dòng này để hiện nút Run workflow
+  workflow_dispatch:
 
 jobs:
   run-ptero:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # Chạy tối đa ~5h50p rồi tự restart
+    timeout-minutes: 350
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,11 +32,11 @@ jobs:
           rclone sync gdrive1:/pterobackups/ ./backups/ --progress || echo "No backup folder yet"
           latest=$(ls -t backups/latest-full-*.tar.gz 2>/dev/null | head -1)
           if [ -n "$latest" ]; then
-            echo "Đang restore backup mới nhất: $latest"
+            echo "Restoring from: $latest"
             tar -xzvf "$latest" -C /
-            echo "Restore hoàn tất"
+            echo "Restore completed"
           else
-            echo "Không có backup cũ – khởi động mới hoàn toàn"
+            echo "No previous backup – fresh start"
           fi
 
       - name: Create docker-compose files
@@ -121,38 +121,34 @@ EOF
           cd pterodactyl/panel && docker-compose up -d
           cd ../wings && docker-compose up -d
 
-      - name: Initial Panel setup (nếu cần)
+      - name: Initial Panel setup
         run: |
           cd pterodactyl/panel
           docker-compose exec panel php artisan key:generate --force || true
           docker-compose exec panel php artisan migrate --seed --force || true
 
-      - name: Start Ngrok with static domain
+      - name: Start Ngrok
         run: |
           ./ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
           ./ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 80 > ngrok.log 2>&1 &
-          echo "Pterodactyl Panel đang chạy tại: https://${{ secrets.NGROK_DOMAIN }}"
+          echo "Panel accessible at: https://${{ secrets.NGROK_DOMAIN }}"
           sleep 15
 
-      - name: Final full backup & Self-restart
+      - name: Final backup & Self-restart
         env:
           PAT: ${{ secrets.PAT }}
         run: |
           START=$(date +%s)
           while true; do
-            ELAPSED=$((($(date +%s) - START)/60))
+            ELAPSED=$((( $(date +%s) - START ) / 60))
             if [ $ELAPSED -ge 330 ]; then
-              echo "=== BẮT ĐẦU FINAL FULL BACKUP TRƯỚC KHI RESTART ==="
-              BACKUP_FILE="/tmp/ptero-full-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-              tar -czvf "$BACKUP_FILE" \
-                /pterodactyl/ \
-                /var/lib/docker/volumes/ || true
-
+              echo "=== FINAL BACKUP BEFORE RESTART ==="
+              BACKUP_FILE="/tmp/ptero-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+              tar -czvf "$BACKUP_FILE" /pterodactyl/ /var/lib/docker/volumes/ || true
               rclone copy "$BACKUP_FILE" gdrive1:/pterobackups/ --progress
               cp "$BACKUP_FILE" backups/latest-full-$(date +%Y%m%d-%H%M%S).tar.gz
               rclone copy backups/latest-full-*.tar.gz gdrive1:/pterobackups/ --progress
-
-              echo "Final backup hoàn tất và đã đồng bộ lên gdrive1"
+              echo "Backup completed"
 
               curl -X POST \
                 -H "Authorization: token $PAT" \
@@ -160,12 +156,12 @@ EOF
                 https://api.github.com/repos/${{ github.repository }}/dispatches \
                 -d '{"event_type":"start-ptero"}'
 
-              echo "Đã trigger workflow mới thành công."
+              echo "Triggered new workflow"
               exit 0
             fi
-            echo "Đã chạy $ELAPSED phút – tiếp tục giữ alive..."
+            echo "Running $ELAPSED minutes..."
             sleep 300
           done
 
-      - name: Keep workflow alive
+      - name: Keep alive
         run: tail -f /dev/null
